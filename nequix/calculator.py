@@ -1,7 +1,9 @@
 import urllib.request
+import warnings
 from pathlib import Path
 
 import equinox as eqx
+import jax
 import jraph
 import numpy as np
 from ase.calculators.calculator import Calculator, all_changes
@@ -101,6 +103,8 @@ class NequixCalculator(Calculator):
         backend: str = "jax",
         use_kernel: bool = True,
         use_compile: bool = False,  # Only for torch backend
+        n_devices: int = None,  # Only for jax backend, number of devices for sharded inference
+        skin: float = 0.3,  # Only for jax backend, neighbor list skin in Angstrom
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -109,6 +113,20 @@ class NequixCalculator(Calculator):
             import torch
 
             assert torch.cuda.is_available(), "Kernels need GPU environment"
+
+        self.mesh = None
+        if n_devices is not None and (n_devices == "all" or int(n_devices) > 1):
+            if backend != "jax":
+                raise ValueError("n_devices is only supported with the jax backend")
+            from nequix.distributed import get_mesh
+
+            if use_kernel:
+                warnings.warn(
+                    "kernel=True is not yet supported with multi-device inference, "
+                    "falling back to use_kernel=False"
+                )
+                use_kernel = False
+            self.mesh = get_mesh(n_devices)
 
         self.model, self.config = from_pretrained(model_name, model_path, backend, use_kernel)
 
@@ -126,18 +144,39 @@ class NequixCalculator(Calculator):
         self.cutoff = self.config["cutoff"]
         self._capacity = None
         self._capacity_multiplier = capacity_multiplier
+        # edge capacity must be divisible by the number of edge shards
+        self._n_shards = self.mesh.devices.size if self.mesh is not None else 1
         self.backend = backend
+
+        # Verlet-skin neighbor list cache: the neighbor list is built with
+        # cutoff + skin and reused until an atom has moved by more than skin/2
+        # (or the cell/numbers change). Edges between cutoff and cutoff + skin
+        # contribute exactly zero (the radial envelope is zero and the radial
+        # MLP has no biases), so results are identical to skin=0.
+        self.skin = skin
+        self._nl_graph = None  # padded GraphsTuple on device, positions stale
+        self._nl_positions = None  # positions at the last neighbor list build
+        self._nl_builds = 0  # number of neighbor list builds (for testing)
+
+        if backend == "jax":
+            if self.mesh is not None:
+                mesh = self.mesh
+                self._forward = eqx.filter_jit(lambda model, graph: model(graph, mesh=mesh))
+            else:
+                self._forward = eqx.filter_jit(lambda model, graph: model(graph))
 
     def _pad_graph_jax(self, graph, numbers_changed=False):
         # maintain edge capacity with _capacity_multiplier over edges,
         # recalculate if numbers (system) changes, or if the capacity is exceeded
         if self._capacity is None or numbers_changed or graph.n_edge[0] > self._capacity:
             raw = int(np.ceil(graph.n_edge[0] * self._capacity_multiplier))
-            # round up edges to the nearest multiple of 64
+            # round up edges to the nearest multiple of 64 (times the number of
+            # edge shards, so the edges divide evenly across devices)
             # NB: this avoids excessive recompilation in high-throughput
             # workflows (e.g.  material relaxtions) but this number may need
             # to be tuned depending on the system sizes
-            self._capacity = ((raw + 63) // 64) * 64
+            multiple = 64 * self._n_shards
+            self._capacity = ((raw + multiple - 1) // multiple) * multiple
 
         # round up nodes to the nearest multiple of 8
         # NB: this avoids excessive recompilation in high-throughput
@@ -149,16 +188,47 @@ class NequixCalculator(Calculator):
         graph = jraph.pad_with_graphs(graph, n_node=n_node, n_edge=self._capacity, n_graph=2)
         return graph
 
-    def calculate(self, atoms=None, properties=None, system_changes=all_changes):
-        Calculator.calculate(self, atoms)
-        processed_graph = preprocess_graph(atoms, self.atom_indices, self.cutoff, False)
-        if self.backend == "jax":
+    def _get_padded_graph_jax(self, atoms, system_changes):
+        # rebuild the neighbor list only when the cached one may be invalid
+        rebuild = (
+            self._nl_graph is None
+            or any(c in system_changes for c in ("numbers", "cell", "pbc"))
+            or len(atoms) != self._nl_positions.shape[0]
+            or self.skin <= 0.0
+            or np.max(
+                np.sum((atoms.positions - self._nl_positions) ** 2, axis=1)
+            ) > (self.skin / 2) ** 2
+        )
+        if rebuild:
+            processed_graph = preprocess_graph(
+                atoms, self.atom_indices, self.cutoff + self.skin, False
+            )
             graph = dict_to_graphstuple(processed_graph)
             graph = self._pad_graph_jax(graph, "numbers" in system_changes)
-            energy, forces, stress = eqx.filter_jit(self.model)(graph)
+            # keep the (static) graph structure on device so that only the
+            # positions are transferred on subsequent calls
+            graph = jax.device_put(graph)
+            self._nl_graph = graph
+            self._nl_positions = atoms.positions.copy()
+            self._nl_builds += 1
+            return graph
+
+        # neighbor list still valid: update only the positions
+        positions = np.zeros(self._nl_graph.nodes["positions"].shape, dtype=np.float32)
+        positions[: len(atoms)] = atoms.positions
+        return self._nl_graph._replace(
+            nodes={**self._nl_graph.nodes, "positions": jax.numpy.asarray(positions)}
+        )
+
+    def calculate(self, atoms=None, properties=None, system_changes=all_changes):
+        Calculator.calculate(self, atoms)
+        if self.backend == "jax":
+            graph = self._get_padded_graph_jax(atoms, system_changes)
+            energy, forces, stress = self._forward(self.model, graph)
             forces = forces[: len(atoms)]
 
         elif self.backend == "torch":
+            processed_graph = preprocess_graph(atoms, self.atom_indices, self.cutoff, False)
             import torch
 
             graph = dict_to_pytorch_geometric(processed_graph)

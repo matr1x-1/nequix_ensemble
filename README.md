@@ -71,6 +71,35 @@ Arguments
 - `capacity_multiplier` (float, default 1.1): JAX-only; padding factor to limit recompiles.
 - `use_compile` (bool, default True): Torch-only; on GPU, uses `torch.compile()`.
 - `use_kernel` (bool, default True): on GPU, use [OpenEquivariance](https://github.com/PASSIONLab/OpenEquivariance) kernels.
+- `n_devices` (int | "all", optional): JAX-only; run inference sharded across multiple
+  devices (e.g. GPUs) of a single host. See below.
+- `skin` (float, default 0.3): JAX-only; neighbor list skin in Angstrom. The neighbor
+  list is built with `cutoff + skin` and reused across calls until an atom has moved
+  by more than `skin / 2` (or the cell/composition changes), which amortizes the CPU
+  neighbor list cost over many MD steps. Results are identical to `skin=0`: edges
+  beyond the model cutoff contribute exactly zero. Set `skin=0` to rebuild the
+  neighbor list on every call.
+
+#### Multi-GPU inference
+
+For large systems, the JAX backend can shard a calculation across all local
+GPUs: the edges of the atomistic graph (where most of the work is) are split
+evenly across devices, while node arrays and model weights are replicated, with
+one all-reduce per message-passing layer. Energies, forces, and stress match
+the single-device results up to floating-point reduction order.
+
+```python
+atoms.calc = NequixCalculator("nequix-mp-1", n_devices="all", use_kernel=False)
+```
+
+Notes:
+- This helps for systems large enough to saturate more than one GPU
+  (typically several thousand atoms); for small systems the per-layer
+  collective overhead makes it slower than a single device.
+- `kernel=True` is not yet supported together with `n_devices`.
+- Multi-device inference is also available directly on the model via
+  `model(graph, mesh=nequix.distributed.get_mesh(n))`, where the (padded)
+  edge count must be divisible by `n`.
 
 ### Training
 

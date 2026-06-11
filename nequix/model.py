@@ -9,6 +9,7 @@ import jax
 import jax.numpy as jnp
 import jraph
 
+from nequix.distributed import all_reduce_sum, shard_map_no_check
 from nequix.layer_norm import RMSLayerNorm
 
 
@@ -253,6 +254,7 @@ class NequixConvolution(eqx.Module):
         radial_basis: jax.Array,
         senders: jax.Array,
         receivers: jax.Array,
+        axis_name: Optional[str] = None,
     ) -> e3nn.IrrepsArray:
         messages = self.linear_1(features)
         radial_message = jax.vmap(self.radial_mlp)(radial_basis)
@@ -273,6 +275,13 @@ class NequixConvolution(eqx.Module):
             messages = e3nn.tensor_product(messages, sh, filter_ir_out=self.tp_irreps)
             messages = messages * radial_message
             messages_agg = e3nn.scatter_sum(messages, dst=receivers, output_size=features.shape[0])
+
+        if axis_name is not None:
+            # edges are sharded across devices: each device aggregated only its own
+            # edge shard, so sum the partial aggregates from all devices
+            messages_agg = e3nn.IrrepsArray(
+                messages_agg.irreps, all_reduce_sum(messages_agg.array, axis_name)
+            )
 
         messages_agg = messages_agg / jnp.sqrt(jax.lax.stop_gradient(self.avg_n_neighbors))
 
@@ -371,6 +380,7 @@ class Nequix(eqx.Module):
         species: jax.Array,
         senders: jax.Array,
         receivers: jax.Array,
+        axis_name: Optional[str] = None,
     ):
         # input features are one-hot encoded species
         features = e3nn.IrrepsArray(
@@ -406,6 +416,7 @@ class Nequix(eqx.Module):
                 radial_basis,
                 senders,
                 receivers,
+                axis_name=axis_name,
             )
 
         node_energies = self.readout(features)
@@ -420,7 +431,12 @@ class Nequix(eqx.Module):
 
         return node_energies.array
 
-    def __call__(self, data: jraph.GraphsTuple):
+    def __call__(
+        self, data: jraph.GraphsTuple, mesh: Optional[jax.sharding.Mesh] = None
+    ):
+        if mesh is not None and mesh.devices.size > 1:
+            return self._call_sharded(data, mesh)
+
         if data.globals["cell"] is None:
             # compute forces and stress as gradient of total energy w.r.t positions
             def total_energy_fn(positions: jax.Array):
@@ -480,6 +496,175 @@ class Nequix(eqx.Module):
         )
 
         if data.globals["cell"] is None:
+            stress = None
+        else:
+            det = jnp.abs(jnp.linalg.det(data.globals["cell"]))[:, None, None]
+            det = jnp.where(det > 0.0, det, 1.0)  # padded graphs have det = 0
+            stress = virial / det
+            # padded stress may be nan, so we mask them
+            graph_mask = jraph.get_graph_padding_mask(data)
+            stress = jnp.where(graph_mask[:, None, None], stress, 0.0)
+
+        return graph_energies[:, 0], -minus_forces, stress
+
+    def _call_sharded(self, data: jraph.GraphsTuple, mesh: jax.sharding.Mesh):
+        """Same as __call__, but with the edges sharded across the devices of `mesh`.
+
+        Node arrays and model weights are replicated on every device; each device
+        computes messages for its own contiguous shard of the edges, with one
+        all-reduce per layer (see NequixConvolution.__call__). To compute forces
+        and stress, each device differentiates the energy of a disjoint subset of
+        the nodes (so that the per-device objectives sum to the total energy) and
+        the per-device gradients are summed with a final all-reduce.
+        """
+        if any(layer.kernel for layer in self.layers):
+            raise NotImplementedError(
+                "kernel=True has not been validated with multi-device inference yet, "
+                "load the model with kernel=False to use it with a mesh"
+            )
+        axis_name = mesh.axis_names[0]
+        n_devices = mesh.devices.size
+        n_edges = data.senders.shape[0]
+        if n_edges % n_devices != 0:
+            raise ValueError(
+                f"the number of (padded) edges ({n_edges}) must be divisible by the "
+                f"number of devices ({n_devices}), pad the graph accordingly "
+                f"(see NequixCalculator._pad_graph_jax)"
+            )
+        if not isinstance(data.nodes["positions"], jax.core.Tracer):
+            # called eagerly: run under jit, since some operations (e.g. the
+            # normalization constants of e3nn.gate) cannot be executed in
+            # shard_map's eager per-device mode. NB: jitting here is not cached
+            # across calls, wrap the model call in eqx.filter_jit (as
+            # NequixCalculator does) to avoid recompilation
+            return eqx.filter_jit(lambda model, data: model._call_sharded(data, mesh))(
+                self, data
+            )
+
+        n_graphs = data.n_node.shape[0]
+        params, static = eqx.partition(self, eqx.is_array)
+        spec_replicated = jax.sharding.PartitionSpec()
+        spec_sharded = jax.sharding.PartitionSpec(axis_name)
+
+        def partition_mask(n_node: int):
+            # assign each node to one device (round-robin) so that the per-device
+            # partial energies sum to the total energy
+            return (jnp.arange(n_node) % n_devices) == jax.lax.axis_index(axis_name)
+
+        if data.globals["cell"] is None:
+
+            def body(params, positions, species, senders, receivers):
+                model = eqx.combine(params, static)
+                part_mask = partition_mask(positions.shape[0])
+
+                def total_energy_fn(positions: jax.Array):
+                    r = positions[senders] - positions[receivers]
+                    node_energies = model.node_energies(
+                        r, species, senders, receivers, axis_name=axis_name
+                    )
+                    partial_energy = jnp.sum(jnp.where(part_mask, node_energies[:, 0], 0.0))
+                    return partial_energy, node_energies
+
+                minus_forces, node_energies = jax.grad(total_energy_fn, has_aux=True)(positions)
+                return all_reduce_sum(minus_forces, axis_name), node_energies
+
+            minus_forces, node_energies = shard_map_no_check(
+                body,
+                mesh,
+                in_specs=(
+                    spec_replicated,
+                    spec_replicated,
+                    spec_replicated,
+                    spec_sharded,
+                    spec_sharded,
+                ),
+                out_specs=(spec_replicated, spec_replicated),
+            )(
+                params,
+                data.nodes["positions"],
+                data.nodes["species"],
+                data.senders,
+                data.receivers,
+            )
+            virial = None
+        else:
+            node_gidx = node_graph_idx(data)
+            edge_gidx = jnp.repeat(
+                jnp.arange(n_graphs), data.n_edge, axis=0, total_repeat_length=n_edges
+            )
+
+            def body(
+                params, positions, species, cell, node_gidx, senders, receivers, shifts, edge_gidx
+            ):
+                model = eqx.combine(params, static)
+                part_mask = partition_mask(positions.shape[0])
+
+                def total_energy_fn(positions_eps: tuple[jax.Array, jax.Array]):
+                    positions, eps = positions_eps
+                    eps_sym = (eps + eps.swapaxes(1, 2)) / 2
+                    # apply strain to positions and cell
+                    positions = positions + jnp.einsum(
+                        "ik,ikj->ij", positions, eps_sym[node_gidx]
+                    )
+                    cell_strained = cell + jnp.einsum("bij,bjk->bik", cell, eps_sym)
+                    offsets = jnp.einsum("ij,ijk->ik", shifts, cell_strained[edge_gidx])
+                    r = positions[senders] - positions[receivers] + offsets
+                    node_energies = model.node_energies(
+                        r, species, senders, receivers, axis_name=axis_name
+                    )
+                    partial_energy = jnp.sum(jnp.where(part_mask, node_energies[:, 0], 0.0))
+                    return partial_energy, node_energies
+
+                eps = jnp.zeros_like(cell)
+                (minus_forces, virial), node_energies = jax.grad(total_energy_fn, has_aux=True)(
+                    (positions, eps)
+                )
+                return (
+                    all_reduce_sum(minus_forces, axis_name),
+                    all_reduce_sum(virial, axis_name),
+                    node_energies,
+                )
+
+            minus_forces, virial, node_energies = shard_map_no_check(
+                body,
+                mesh,
+                in_specs=(
+                    spec_replicated,
+                    spec_replicated,
+                    spec_replicated,
+                    spec_replicated,
+                    spec_replicated,
+                    spec_sharded,
+                    spec_sharded,
+                    spec_sharded,
+                    spec_sharded,
+                ),
+                out_specs=(spec_replicated, spec_replicated, spec_replicated),
+            )(
+                params,
+                data.nodes["positions"],
+                data.nodes["species"],
+                data.globals["cell"],
+                node_gidx,
+                data.senders,
+                data.receivers,
+                data.edges["shifts"],
+                edge_gidx,
+            )
+
+        # padded nodes may have nan forces, so we mask them
+        node_mask = jraph.get_node_padding_mask(data)
+        minus_forces = jnp.where(node_mask[:, None], minus_forces, 0.0)
+
+        # compute total energies across each subgraph
+        graph_energies = jraph.segment_sum(
+            node_energies,
+            node_graph_idx(data),
+            num_segments=n_graphs,
+            indices_are_sorted=True,
+        )
+
+        if virial is None:
             stress = None
         else:
             det = jnp.abs(jnp.linalg.det(data.globals["cell"]))[:, None, None]
