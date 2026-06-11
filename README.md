@@ -96,7 +96,10 @@ Notes:
 - This helps for systems large enough to saturate more than one GPU
   (typically several thousand atoms); for small systems the per-layer
   collective overhead makes it slower than a single device.
-- `kernel=True` is not yet supported together with `n_devices`.
+- OpenEquivariance kernels (`use_kernel=True`) compose with `n_devices`: each
+  device runs the fused kernel on its own edge shard. The kernels use atomic
+  adds, so results are not bitwise reproducible between runs (same as on a
+  single device).
 - Multi-device inference is also available directly on the model via
   `model(graph, mesh=nequix.distributed.get_mesh(n))`, where the (padded)
   edge count must be divisible by `n`.

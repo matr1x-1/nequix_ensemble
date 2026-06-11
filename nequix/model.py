@@ -517,11 +517,6 @@ class Nequix(eqx.Module):
         the nodes (so that the per-device objectives sum to the total energy) and
         the per-device gradients are summed with a final all-reduce.
         """
-        if any(layer.kernel for layer in self.layers):
-            raise NotImplementedError(
-                "kernel=True has not been validated with multi-device inference yet, "
-                "load the model with kernel=False to use it with a mesh"
-            )
         axis_name = mesh.axis_names[0]
         n_devices = mesh.devices.size
         n_edges = data.senders.shape[0]

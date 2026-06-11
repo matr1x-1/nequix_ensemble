@@ -1,5 +1,4 @@
 import urllib.request
-import warnings
 from pathlib import Path
 
 import equinox as eqx
@@ -120,12 +119,6 @@ class NequixCalculator(Calculator):
                 raise ValueError("n_devices is only supported with the jax backend")
             from nequix.distributed import get_mesh
 
-            if use_kernel:
-                warnings.warn(
-                    "kernel=True is not yet supported with multi-device inference, "
-                    "falling back to use_kernel=False"
-                )
-                use_kernel = False
             self.mesh = get_mesh(n_devices)
 
         self.model, self.config = from_pretrained(model_name, model_path, backend, use_kernel)
