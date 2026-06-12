@@ -15,6 +15,34 @@ import numpy as np
 import yaml
 from tqdm import tqdm
 
+try:
+    import vesin
+except ImportError:
+    vesin = None
+
+
+def neighbor_list_ijS(positions, cell, pbc, cutoff):
+    """matscipy-compatible "ijS" neighbor list.
+
+    Uses vesin when available and the pbc are uniform: it is ~1.6x faster than
+    matscipy and releases the GIL, so background neighbor-list builds
+    (NequixCalculator(async_nl=True)) actually overlap with the main thread.
+    Falls back to matscipy otherwise (mixed pbc). Both produce identical edge
+    sets (pair i->j with shift S such that r_ij = r_j + S @ cell - r_i).
+    """
+    pbc = np.asarray(pbc)
+    if vesin is not None and (pbc.all() or not pbc.any()):
+        i, j, S = vesin.NeighborList(cutoff=cutoff, full_list=True).compute(
+            points=np.ascontiguousarray(positions, dtype=np.float64),
+            box=np.ascontiguousarray(cell, dtype=np.float64),
+            periodic=bool(pbc.all()),
+            quantities="ijS",
+        )
+        return i, j, S
+    return matscipy.neighbours.neighbour_list(
+        "ijS", positions=positions, cell=cell, pbc=pbc, cutoff=cutoff
+    )
+
 
 def preprocess_graph(
     atoms: ase.Atoms,
@@ -23,9 +51,7 @@ def preprocess_graph(
     targets: bool,
 ) -> dict:
     cell = complete_cell(atoms.cell)  # avoids singular cell
-    src, dst, shift = matscipy.neighbours.neighbour_list(
-        "ijS", positions=atoms.positions, cell=cell, pbc=atoms.pbc, cutoff=cutoff
-    )
+    src, dst, shift = neighbor_list_ijS(atoms.positions, cell, atoms.pbc, cutoff)
     graph_dict = {
         "n_node": np.array([len(atoms)]).astype(np.int32),
         "n_edge": np.array([len(src)]).astype(np.int32),

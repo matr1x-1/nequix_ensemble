@@ -79,6 +79,16 @@ Arguments
   neighbor list cost over many MD steps. Results are identical to `skin=0`: edges
   beyond the model cutoff contribute exactly zero. Set `skin=0` to rebuild the
   neighbor list on every call.
+- `async_nl` (bool, default True): JAX-only; once an atom has moved more than
+  `nl_trigger * skin / 2`, the next neighbor list is built in a background
+  thread (from a snapshot of the current positions) while the still-valid
+  cached list keeps being used, so the build overlaps with the GPU force
+  evaluation instead of stalling the MD loop. The swap is exact for the same
+  reason the skin is. Builds use [vesin](https://github.com/Luthaf/vesin) when
+  available (faster than matscipy and releases the GIL, which the overlap
+  requires), falling back to matscipy for mixed periodic boundary conditions.
+- `nl_trigger` (float, default 0.5): JAX-only; fraction of `skin / 2` at which
+  the background build starts. `0` keeps a build in flight at all times.
 
 #### Multi-GPU inference
 

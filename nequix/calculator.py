@@ -1,4 +1,6 @@
+import threading
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import equinox as eqx
@@ -104,6 +106,8 @@ class NequixCalculator(Calculator):
         use_compile: bool = False,  # Only for torch backend
         n_devices: int = None,  # Only for jax backend, number of devices for sharded inference
         skin: float = 0.3,  # Only for jax backend, neighbor list skin in Angstrom
+        async_nl: bool = True,  # Only for jax backend, rebuild the neighbor list in a background thread
+        nl_trigger: float = 0.5,  # start the background rebuild at this fraction of skin/2 (0 = always)
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -151,6 +155,22 @@ class NequixCalculator(Calculator):
         self._nl_positions = None  # positions at the last neighbor list build
         self._nl_builds = 0  # number of neighbor list builds (for testing)
 
+        # Asynchronous rebuild: once an atom has moved more than
+        # nl_trigger * skin/2 since the last build, the next list is built in a
+        # background thread from a snapshot of the current positions while the
+        # cached list (still valid until skin/2) keeps being used. The swap is
+        # exact for the same reason the skin is: any list built within its own
+        # skin/2 validity window yields identical forces. If atoms cross skin/2
+        # before the background build lands, we block on it (and fall back to a
+        # synchronous rebuild if even the pending build is already too stale).
+        self.async_nl = async_nl
+        self.nl_trigger = nl_trigger  # fraction of skin/2 at which the async build starts
+        self._nl_future = None  # (future, positions at snapshot) or None
+        self._nl_executor = None  # created lazily on first async build
+        self._nl_build_lock = threading.Lock()  # serializes _pad_graph_jax capacity updates
+        self._nl_sync_rebuilds = 0  # builds the main thread had to wait for (for testing)
+        self._nl_waits = 0  # times the main thread blocked on a pending build (for testing)
+
         if backend == "jax":
             if self.mesh is not None:
                 mesh = self.mesh
@@ -181,30 +201,74 @@ class NequixCalculator(Calculator):
         graph = jraph.pad_with_graphs(graph, n_node=n_node, n_edge=self._capacity, n_graph=2)
         return graph
 
-    def _get_padded_graph_jax(self, atoms, system_changes):
-        # rebuild the neighbor list only when the cached one may be invalid
-        rebuild = (
-            self._nl_graph is None
-            or any(c in system_changes for c in ("numbers", "cell", "pbc"))
-            or len(atoms) != self._nl_positions.shape[0]
-            or self.skin <= 0.0
-            or np.max(
-                np.sum((atoms.positions - self._nl_positions) ** 2, axis=1)
-            ) > (self.skin / 2) ** 2
-        )
-        if rebuild:
+    def _build_padded_graph_jax(self, atoms, numbers_changed=False):
+        # full host-side neighbor list build; safe to call from a worker thread
+        # (only the main thread mutates the calculator's cache state; the lock
+        # serializes the capacity bookkeeping inside _pad_graph_jax)
+        with self._nl_build_lock:
             processed_graph = preprocess_graph(
                 atoms, self.atom_indices, self.cutoff + self.skin, False
             )
             graph = dict_to_graphstuple(processed_graph)
-            graph = self._pad_graph_jax(graph, "numbers" in system_changes)
+            graph = self._pad_graph_jax(graph, numbers_changed)
             # keep the (static) graph structure on device so that only the
             # positions are transferred on subsequent calls
-            graph = jax.device_put(graph)
-            self._nl_graph = graph
-            self._nl_positions = atoms.positions.copy()
-            self._nl_builds += 1
+            return jax.device_put(graph)
+
+    def _adopt_nl(self, graph, build_positions):
+        self._nl_graph = graph
+        self._nl_positions = build_positions.copy()
+        self._nl_builds += 1
+
+    def _get_padded_graph_jax(self, atoms, system_changes):
+        # the cached neighbor list is unusable if the system itself changed
+        reset = (
+            self._nl_graph is None
+            or any(c in system_changes for c in ("numbers", "cell", "pbc"))
+            or len(atoms) != self._nl_positions.shape[0]
+        )
+        if reset or self.skin <= 0.0:
+            self._nl_future = None  # a pending async build is stale, discard it
+            graph = self._build_padded_graph_jax(atoms, "numbers" in system_changes)
+            self._adopt_nl(graph, atoms.positions)
+            self._nl_sync_rebuilds += 1
             return graph
+
+        half_skin_sq = (self.skin / 2) ** 2
+
+        def disp_sq():
+            return np.max(np.sum((atoms.positions - self._nl_positions) ** 2, axis=1))
+
+        # adopt a finished background build
+        if self._nl_future is not None and self._nl_future[0].done():
+            future, build_positions = self._nl_future
+            self._nl_future = None
+            self._adopt_nl(future.result(), build_positions)
+
+        if disp_sq() > half_skin_sq:
+            # cached list expired; wait for the pending build if there is one
+            if self._nl_future is not None:
+                future, build_positions = self._nl_future
+                self._nl_future = None
+                self._adopt_nl(future.result(), build_positions)
+                self._nl_waits += 1
+            if disp_sq() > half_skin_sq:
+                # no pending build, or even that one is already too stale
+                graph = self._build_padded_graph_jax(atoms, False)
+                self._adopt_nl(graph, atoms.positions)
+                self._nl_sync_rebuilds += 1
+                return graph
+        elif (
+            self.async_nl
+            and self._nl_future is None
+            and disp_sq() > self.nl_trigger**2 * half_skin_sq
+        ):
+            # start the next build in the background from a position snapshot
+            if self._nl_executor is None:
+                self._nl_executor = ThreadPoolExecutor(max_workers=1)
+            snapshot = atoms.copy()
+            future = self._nl_executor.submit(self._build_padded_graph_jax, snapshot, False)
+            self._nl_future = (future, snapshot.positions)
 
         # neighbor list still valid: update only the positions
         positions = np.zeros(self._nl_graph.nodes["positions"].shape, dtype=np.float32)

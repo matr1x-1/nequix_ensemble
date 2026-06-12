@@ -21,6 +21,7 @@ dependencies = [
     "wandb>=0.19.11",
     "pyyaml>=6.0.2",
     "matscipy>=1.1.1",
+    "vesin>=0.5.0",
     "h5py>=3.14.0",
     "wandb-osh>=1.2.2",
     "cloudpickle>=3.1.1",

@@ -148,6 +148,97 @@ def test_cached_results_match_fresh_calculator(model_path):
     np.testing.assert_allclose(atoms.get_forces(), fresh.get_forces(), rtol=1e-4, atol=1e-6)
 
 
+def test_async_build_adopted_and_matches(model_path):
+    # drift atoms past the async trigger (skin/4) but below skin/2: a
+    # background build must be adopted and every step must match a fresh list
+    atoms = periodic_atoms(n_atoms=20, seed=4)
+    calc = make_calc(model_path, skin=0.5)
+    atoms.calc = calc
+    atoms.get_potential_energy()
+    assert calc._nl_builds == 1 and calc._nl_future is None
+
+    rng = np.random.default_rng(0)
+    saw_pending = False
+    for _ in range(8):
+        atoms.positions += rng.normal(0.0, 0.02, atoms.positions.shape) + 0.03
+        energy = atoms.get_potential_energy()
+        forces = atoms.get_forces()
+        saw_pending = saw_pending or calc._nl_future is not None
+
+        fresh = atoms.copy()
+        fresh.calc = make_calc(model_path, skin=0.0)
+        np.testing.assert_allclose(energy, fresh.get_potential_energy(), rtol=1e-6, atol=1e-6)
+        np.testing.assert_allclose(forces, fresh.get_forces(), rtol=1e-4, atol=1e-6)
+
+        # make adoption timing deterministic for the next call
+        if calc._nl_future is not None:
+            calc._nl_future[0].result()
+
+    assert saw_pending
+    assert calc._nl_builds > 1
+
+
+def test_async_expiry_blocks_on_pending(model_path):
+    # jump past skin/2 (possibly while a build is pending): the calculator must
+    # end up with a valid list and exact results no matter the thread timing
+    atoms = periodic_atoms(n_atoms=20, seed=5)
+    calc = make_calc(model_path, skin=0.5)
+    atoms.calc = calc
+    atoms.get_potential_energy()
+
+    atoms.positions[0] += 0.15  # past trigger (0.125), below skin/2
+    atoms.get_potential_energy()
+
+    atoms.positions[0] += 0.5  # past skin/2
+    energy = atoms.get_potential_energy()
+    forces = atoms.get_forces()
+    assert calc._nl_builds >= 2
+
+    fresh = atoms.copy()
+    fresh.calc = make_calc(model_path, skin=0.0)
+    np.testing.assert_allclose(energy, fresh.get_potential_energy(), rtol=1e-6, atol=1e-6)
+    np.testing.assert_allclose(forces, fresh.get_forces(), rtol=1e-4, atol=1e-6)
+
+
+def test_async_composition_change_discards_pending(model_path):
+    atoms = periodic_atoms(n_atoms=20, seed=6)
+    calc = make_calc(model_path, skin=0.5)
+    atoms.calc = calc
+    atoms.get_potential_energy()
+    atoms.positions += 0.08  # trips the async trigger (|d| = 0.139)
+    atoms.get_potential_energy()
+
+    bigger = periodic_atoms(n_atoms=24, seed=7)
+    bigger.calc = calc
+    energy = bigger.get_potential_energy()
+
+    fresh = bigger.copy()
+    fresh.calc = make_calc(model_path, skin=0.0)
+    np.testing.assert_allclose(energy, fresh.get_potential_energy(), rtol=1e-6, atol=1e-6)
+
+
+def test_async_disabled_never_spawns_thread(model_path):
+    atoms = periodic_atoms(n_atoms=20, seed=8)
+    calc = make_calc(model_path, skin=0.5, async_nl=False)
+    atoms.calc = calc
+    dyn = VelocityVerlet(atoms, timestep=0.5 * units.fs)
+    dyn.run(5)
+    assert calc._nl_executor is None and calc._nl_future is None
+
+
+def test_async_md_trajectory_matches_sync(model_path):
+    # the swap is exact, so trajectories must be identical regardless of when
+    # the background build lands
+    trajectories = {}
+    for async_nl in [False, True]:
+        atoms = periodic_atoms(n_atoms=20, seed=9)
+        atoms.calc = make_calc(model_path, skin=0.5, async_nl=async_nl)
+        dyn = VelocityVerlet(atoms, timestep=0.5 * units.fs)
+        dyn.run(10)
+        trajectories[async_nl] = atoms.get_positions()
+    np.testing.assert_allclose(trajectories[True], trajectories[False], rtol=1e-5, atol=1e-6)
+
+
 @pytest.mark.skipif(len(jax.devices()) < 4, reason="needs 4 (forced host) devices")
 def test_skin_with_sharding(model_path):
     trajectories = []
