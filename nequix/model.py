@@ -432,13 +432,17 @@ class Nequix(eqx.Module):
         return node_energies.array
 
     def __call__(
-        self, data: jraph.GraphsTuple, mesh: Optional[jax.sharding.Mesh] = None
+        self,
+        data: jraph.GraphsTuple,
+        mesh: Optional[jax.sharding.Mesh] = None,
+        compute_stress: bool = True,
     ):
         if mesh is not None and mesh.devices.size > 1:
+            # the sharded path always computes stress
             return self._call_sharded(data, mesh)
 
         if data.globals["cell"] is None:
-            # compute forces and stress as gradient of total energy w.r.t positions
+            # compute forces as gradient of total energy w.r.t positions
             def total_energy_fn(positions: jax.Array):
                 r = positions[data.senders] - positions[data.receivers]
                 node_energies = self.node_energies(
@@ -449,6 +453,30 @@ class Nequix(eqx.Module):
             minus_forces, node_energies = eqx.filter_grad(total_energy_fn, has_aux=True)(
                 data.nodes["positions"]
             )
+            virial = None
+        elif not compute_stress:
+            # forces only: differentiate w.r.t. positions with the cell fixed,
+            # skipping the strain machinery (saves work in MD, where the
+            # stress is never used)
+            cell_per_edge = jnp.repeat(
+                data.globals["cell"],
+                data.n_edge,
+                axis=0,
+                total_repeat_length=data.edges["shifts"].shape[0],
+            )
+            offsets = jnp.einsum("ij,ijk->ik", data.edges["shifts"], cell_per_edge)
+
+            def total_energy_fn(positions: jax.Array):
+                r = positions[data.senders] - positions[data.receivers] + offsets
+                node_energies = self.node_energies(
+                    r, data.nodes["species"], data.senders, data.receivers
+                )
+                return jnp.sum(node_energies), node_energies
+
+            minus_forces, node_energies = eqx.filter_grad(total_energy_fn, has_aux=True)(
+                data.nodes["positions"]
+            )
+            virial = None
         else:
             # compute forces and stress as gradient of total energy w.r.t positions and strain
             def total_energy_fn(positions_eps: tuple[jax.Array, jax.Array]):
@@ -495,7 +523,7 @@ class Nequix(eqx.Module):
             indices_are_sorted=True,
         )
 
-        if data.globals["cell"] is None:
+        if virial is None:
             stress = None
         else:
             det = jnp.abs(jnp.linalg.det(data.globals["cell"]))[:, None, None]

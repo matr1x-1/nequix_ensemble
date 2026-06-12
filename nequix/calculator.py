@@ -170,13 +170,19 @@ class NequixCalculator(Calculator):
         self._nl_build_lock = threading.Lock()  # serializes _pad_graph_jax capacity updates
         self._nl_sync_rebuilds = 0  # builds the main thread had to wait for (for testing)
         self._nl_waits = 0  # times the main thread blocked on a pending build (for testing)
+        self._nl_pos_buffer = None  # reusable host buffer for position updates
 
         if backend == "jax":
             if self.mesh is not None:
                 mesh = self.mesh
                 self._forward = eqx.filter_jit(lambda model, graph: model(graph, mesh=mesh))
+                self._forward_forces = self._forward  # sharded path always computes stress
             else:
                 self._forward = eqx.filter_jit(lambda model, graph: model(graph))
+                # cheaper variant for MD: skips the strain-trick stress
+                self._forward_forces = eqx.filter_jit(
+                    lambda model, graph: model(graph, compute_stress=False)
+                )
 
     def _pad_graph_jax(self, graph, numbers_changed=False):
         # maintain edge capacity with _capacity_multiplier over edges,
@@ -219,6 +225,11 @@ class NequixCalculator(Calculator):
         self._nl_graph = graph
         self._nl_positions = build_positions.copy()
         self._nl_builds += 1
+        # reusable host buffer for the cache-hit position updates; the padded
+        # tail stays zero because only [:n_atoms] is ever written
+        shape = graph.nodes["positions"].shape
+        if self._nl_pos_buffer is None or self._nl_pos_buffer.shape != shape:
+            self._nl_pos_buffer = np.zeros(shape, dtype=np.float32)
 
     def _get_padded_graph_jax(self, atoms, system_changes):
         # the cached neighbor list is unusable if the system itself changed
@@ -271,18 +282,23 @@ class NequixCalculator(Calculator):
             self._nl_future = (future, snapshot.positions)
 
         # neighbor list still valid: update only the positions
-        positions = np.zeros(self._nl_graph.nodes["positions"].shape, dtype=np.float32)
-        positions[: len(atoms)] = atoms.positions
+        self._nl_pos_buffer[: len(atoms)] = atoms.positions
         return self._nl_graph._replace(
-            nodes={**self._nl_graph.nodes, "positions": jax.numpy.asarray(positions)}
+            nodes={**self._nl_graph.nodes, "positions": jax.numpy.asarray(self._nl_pos_buffer)}
         )
 
     def calculate(self, atoms=None, properties=None, system_changes=all_changes):
         Calculator.calculate(self, atoms)
         if self.backend == "jax":
             graph = self._get_padded_graph_jax(atoms, system_changes)
-            energy, forces, stress = self._forward(self.model, graph)
-            forces = forces[: len(atoms)]
+            # skip the stress unless it was asked for (MD asks for forces
+            # only); a later get_stress() triggers a recalculation with
+            # properties=["stress"] because the key is then absent in results
+            need_stress = properties is None or "stress" in properties
+            forward = self._forward if need_stress else self._forward_forces
+            energy, forces, stress = forward(self.model, graph)
+            # one batched device->host transfer for all results
+            energy, forces, stress = jax.device_get((energy, forces[: len(atoms)], stress))
 
         elif self.backend == "torch":
             processed_graph = preprocess_graph(atoms, self.atom_indices, self.cutoff, False)
@@ -340,9 +356,13 @@ class NequixCalculator(Calculator):
         self.results["energy"] = energy
         self.results["free_energy"] = energy
         self.results["forces"] = np.array(forces)
-        self.results["stress"] = (
-            full_3x3_to_voigt_6_stress(np.array(stress[0])) if stress is not None else None
-        )
+        if stress is not None:
+            self.results["stress"] = full_3x3_to_voigt_6_stress(np.array(stress[0]))
+        elif self.backend != "jax" or properties is None or "stress" in properties:
+            # preserve the old "stress is None" result (e.g. no cell); when the
+            # jax path merely skipped the stress, leave the key absent so a
+            # later get_stress() triggers a recalculation
+            self.results["stress"] = None
 
     def get_hessian(self, atoms=None):
         assert self.backend == "jax", "Hessian calculation currently only supported for JAX backend"

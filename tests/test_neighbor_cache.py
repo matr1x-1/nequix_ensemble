@@ -239,6 +239,24 @@ def test_async_md_trajectory_matches_sync(model_path):
     np.testing.assert_allclose(trajectories[True], trajectories[False], rtol=1e-5, atol=1e-6)
 
 
+def test_forces_only_and_stress_on_demand(model_path):
+    # MD-style access (forces/energy) uses the cheaper no-stress forward and
+    # leaves "stress" out of results; get_stress() then triggers a full
+    # recalculation and must match a fresh full calculator
+    atoms = periodic_atoms(n_atoms=20, seed=10)
+    atoms.calc = make_calc(model_path, skin=0.5)
+    forces = atoms.get_forces()
+    energy = atoms.get_potential_energy()
+    assert "stress" not in atoms.calc.results
+    stress = atoms.get_stress()
+
+    fresh = atoms.copy()
+    fresh.calc = make_calc(model_path, skin=0.0)
+    np.testing.assert_allclose(energy, fresh.get_potential_energy(), rtol=1e-6, atol=1e-6)
+    np.testing.assert_allclose(forces, fresh.get_forces(), rtol=1e-5, atol=1e-6)
+    np.testing.assert_allclose(stress, fresh.get_stress(), rtol=1e-5, atol=1e-7)
+
+
 @pytest.mark.skipif(len(jax.devices()) < 4, reason="needs 4 (forced host) devices")
 def test_skin_with_sharding(model_path):
     trajectories = []

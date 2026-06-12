@@ -52,12 +52,21 @@ def preprocess_graph(
 ) -> dict:
     cell = complete_cell(atoms.cell)  # avoids singular cell
     src, dst, shift = neighbor_list_ijS(atoms.positions, cell, atoms.pbc, cutoff)
+    numbers = atoms.get_atomic_numbers()
+    # vectorized species mapping (a python loop here costs ms per neighbor
+    # list rebuild on 10k+ atom systems)
+    if not set(numbers).issubset(atom_indices):
+        bad = sorted(set(numbers) - set(atom_indices))
+        raise KeyError(f"atomic numbers {bad} not supported by this model")
+    lut = np.zeros(max(atom_indices) + 1, dtype=np.int32)
+    lut[list(atom_indices)] = list(atom_indices.values())
+    species = lut[numbers]
     graph_dict = {
         "n_node": np.array([len(atoms)]).astype(np.int32),
         "n_edge": np.array([len(src)]).astype(np.int32),
         "senders": dst.astype(np.int32),
         "receivers": src.astype(np.int32),
-        "species": np.array([atom_indices[n] for n in atoms.get_atomic_numbers()]).astype(np.int32),
+        "species": species,
         "positions": atoms.positions.astype(np.float32),
         "shifts": shift.astype(np.float32),
         "cell": atoms.cell.astype(np.float32) if atoms.pbc.all() else None,
